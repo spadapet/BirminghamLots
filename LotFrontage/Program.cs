@@ -33,6 +33,15 @@ namespace ParcelFrontage
 
         static async Task Main(string[] args)
         {
+            if (args.Length > 0 && args[0].Equals("map", StringComparison.OrdinalIgnoreCase))
+            {
+                double minWidth = args.Length > 1 ? double.Parse(args[1], CultureInfo.InvariantCulture) : 50;
+                double maxWidth = args.Length > 2 ? double.Parse(args[2], CultureInfo.InvariantCulture) : 80;
+                double maxValue = args.Length > 3 ? double.Parse(args[3], CultureInfo.InvariantCulture) : double.PositiveInfinity;
+                await MapMain(minWidth, maxWidth, maxValue);
+                return;
+            }
+
             string inputPath = Path.Combine(AppContext.BaseDirectory, "data", "lots.csv");
             string outputPath = Path.Combine(AppContext.BaseDirectory, "data", "lots_with_dimensions.csv");
 
@@ -222,6 +231,354 @@ namespace ParcelFrontage
                 Console.WriteLine($"ERROR writing output: {ex.Message}");
                 Console.WriteLine("(Close the file in Excel or any other app and re-run.)");
             }
+        }
+
+        // -------------------------------------------------------------------
+        // MAP MODE
+        // -------------------------------------------------------------------
+
+        static async Task MapMain(double minWidth, double maxWidth, double maxValue = double.PositiveInfinity)
+        {
+            string outputCsv = Path.Combine(AppContext.BaseDirectory, "data", "lots_with_dimensions.csv");
+            string sourceCsv = Path.Combine(AppContext.BaseDirectory, "data", "lots.csv");
+            string geocodeCsv = Path.Combine(AppContext.BaseDirectory, "data", "geocodes.csv");
+            string valueSuffix = double.IsPositiveInfinity(maxValue) ? "" : $"_lt{maxValue:F0}";
+            string mapHtml = Path.Combine(AppContext.BaseDirectory, "data", $"map_{minWidth:F0}_{maxWidth:F0}{valueSuffix}.html");
+
+            if (!File.Exists(outputCsv))
+            {
+                Console.WriteLine($"Output CSV not found: {outputCsv}");
+                Console.WriteLine("Run the program in default mode first to produce lots_with_dimensions.csv.");
+                return;
+            }
+
+            // Build Id -> Market Value lookup from the original CSV.
+            var marketValueById = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+            if (File.Exists(sourceCsv))
+            {
+                var srcRows = ReadCsv(sourceCsv);
+                if (srcRows.Count >= 2)
+                {
+                    var srcHeader = srcRows[0];
+                    int srcIdIdx = srcHeader.FindIndex(h => h.Equals("Id", StringComparison.OrdinalIgnoreCase));
+                    int mvIdx = srcHeader.FindIndex(h => h.Equals("Estimated Value", StringComparison.OrdinalIgnoreCase));
+                    if (srcIdIdx >= 0 && mvIdx >= 0)
+                    {
+                        for (int i = 1; i < srcRows.Count; i++)
+                        {
+                            var r = srcRows[i];
+                            string id = Get(r, srcIdIdx);
+                            if (string.IsNullOrWhiteSpace(id)) continue;
+                            if (double.TryParse(Get(r, mvIdx), NumberStyles.Float, CultureInfo.InvariantCulture, out double mv) && mv > 0)
+                            {
+                                marketValueById[id] = mv;
+                            }
+                        }
+                    }
+                }
+                Console.WriteLine($"Market value entries: {marketValueById.Count}");
+            }
+
+            var rows = ReadCsv(outputCsv);
+            if (rows.Count < 2)
+            {
+                Console.WriteLine("Output CSV is empty.");
+                return;
+            }
+
+            var header = rows[0];
+            int idIdx = header.FindIndex(h => h.Equals("Id", StringComparison.OrdinalIgnoreCase));
+            int addressIdx = header.FindIndex(h => h.Equals("Address", StringComparison.OrdinalIgnoreCase));
+            int cityIdx = header.FindIndex(h => h.Equals("City", StringComparison.OrdinalIgnoreCase));
+            int stateIdx = header.FindIndex(h => h.Equals("State", StringComparison.OrdinalIgnoreCase));
+            int zipIdx = header.FindIndex(h => h.Equals("Zip", StringComparison.OrdinalIgnoreCase));
+            int widthIdx = header.FindIndex(h => h.Equals("lot_width", StringComparison.OrdinalIgnoreCase));
+            int depthIdx = header.FindIndex(h => h.Equals("lot_depth", StringComparison.OrdinalIgnoreCase));
+            int propwireIdx = header.FindIndex(h => h.Equals("propwire_link", StringComparison.OrdinalIgnoreCase));
+
+            if (widthIdx < 0 || addressIdx < 0)
+            {
+                Console.WriteLine("Required columns missing.");
+                return;
+            }
+
+            // Filter rows by lot_width range.
+            var matches = new List<(string id, string addr, string city, string state, string zip, double width, double depth, string propwire, double marketValue)>();
+            for (int i = 1; i < rows.Count; i++)
+            {
+                var row = rows[i];
+                string widthStr = Get(row, widthIdx);
+                if (!double.TryParse(widthStr, NumberStyles.Float, CultureInfo.InvariantCulture, out double width)) continue;
+                if (width < minWidth || width > maxWidth) continue;
+
+                double.TryParse(Get(row, depthIdx), NumberStyles.Float, CultureInfo.InvariantCulture, out double depth);
+
+                string id = Get(row, idIdx);
+                marketValueById.TryGetValue(id, out double mv);
+
+                if (!double.IsPositiveInfinity(maxValue))
+                {
+                    if (mv <= 0 || mv >= maxValue) continue;
+                }
+
+                matches.Add((
+                    id,
+                    Get(row, addressIdx),
+                    Get(row, cityIdx),
+                    Get(row, stateIdx),
+                    Get(row, zipIdx),
+                    width,
+                    depth,
+                    Get(row, propwireIdx),
+                    mv
+                ));
+            }
+
+            Console.WriteLine($"Lots with lot_width in [{minWidth}, {maxWidth}]: {matches.Count}");
+
+            // Load existing geocode cache (id,lat,lon).
+            var geocodeCache = LoadGeocodeCache(geocodeCsv);
+            Console.WriteLine($"Geocode cache entries: {geocodeCache.Count}");
+
+            // Determine which matches need geocoding.
+            var toGeocode = matches.Where(m => !geocodeCache.ContainsKey(m.id)).ToList();
+            Console.WriteLine($"To geocode: {toGeocode.Count}");
+
+            if (toGeocode.Count > 0)
+            {
+                using var throttle = new SemaphoreSlim(MaxConcurrency, MaxConcurrency);
+                int done = 0;
+                int errors = 0;
+                var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+                var lockObj = new object();
+                int sinceSave = 0;
+
+                var tasks = toGeocode.Select(async m =>
+                {
+                    await throttle.WaitAsync();
+                    try
+                    {
+                        string fullAddress = string.Join(", ",
+                            new[] { m.addr, m.city, m.state, m.zip }
+                                .Where(s => !string.IsNullOrWhiteSpace(s)));
+
+                        try
+                        {
+                            var (lon, lat) = await GeocodeAddress(fullAddress, locationType: null);
+                            lock (lockObj)
+                            {
+                                geocodeCache[m.id] = (lat, lon);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Interlocked.Increment(ref errors);
+                            Console.WriteLine($"  ERROR ({fullAddress}): {ex.Message}");
+                        }
+
+                        int d = Interlocked.Increment(ref done);
+                        int s = Interlocked.Increment(ref sinceSave);
+
+                        if (d % 50 == 0 || d == toGeocode.Count)
+                        {
+                            double rate = d / Math.Max(0.001, stopwatch.Elapsed.TotalSeconds);
+                            int remaining = toGeocode.Count - d;
+                            TimeSpan eta = TimeSpan.FromSeconds(remaining / Math.Max(0.001, rate));
+                            Console.WriteLine($"[{d}/{toGeocode.Count}] errors: {errors}, rate: {rate:F1}/s, eta: {eta:hh\\:mm\\:ss}");
+                        }
+
+                        if (s >= 250)
+                        {
+                            lock (lockObj)
+                            {
+                                if (sinceSave >= 250)
+                                {
+                                    sinceSave = 0;
+                                    try { SaveGeocodeCache(geocodeCsv, geocodeCache); }
+                                    catch (IOException) { /* skip checkpoint if locked */ }
+                                }
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        throttle.Release();
+                    }
+                }).ToArray();
+
+                await Task.WhenAll(tasks);
+                SaveGeocodeCache(geocodeCsv, geocodeCache);
+                Console.WriteLine($"Geocoded {done} addresses ({errors} errors).");
+            }
+
+            // Build the HTML map.
+            var markers = matches
+                .Where(m => geocodeCache.ContainsKey(m.id))
+                .Select(m =>
+                {
+                    var (lat, lon) = geocodeCache[m.id];
+                    return new
+                    {
+                        m.id,
+                        m.addr,
+                        m.city,
+                        m.state,
+                        m.zip,
+                        m.width,
+                        m.depth,
+                        m.propwire,
+                        m.marketValue,
+                        lat,
+                        lon
+                    };
+                })
+                .ToList();
+
+            if (markers.Count == 0)
+            {
+                Console.WriteLine("No geocoded markers to plot.");
+                return;
+            }
+
+            double centerLat = markers.Average(m => m.lat);
+            double centerLon = markers.Average(m => m.lon);
+
+            var markersJson = JsonSerializer.Serialize(markers);
+
+            string html = $$"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>Lots {{minWidth}}–{{maxWidth}} ft frontage</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        html, body { margin: 0; height: 100%; }
+        #map { height: 100%; }
+        .leaflet-popup-content { font-family: sans-serif; font-size: 13px; }
+        .leaflet-popup-content a { color: #1a73e8; text-decoration: none; }
+        .price-label {
+            background: rgba(255,255,255,0.92);
+            border: 1px solid #1a73e8;
+            border-radius: 4px;
+            padding: 1px 4px;
+            font-family: sans-serif;
+            font-size: 11px;
+            font-weight: 600;
+            color: #1a73e8;
+            white-space: nowrap;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.15);
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        const markers = {{markersJson}};
+        const map = L.map('map').setView([{{centerLat.ToString("G", CultureInfo.InvariantCulture)}}, {{centerLon.ToString("G", CultureInfo.InvariantCulture)}}], 14);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '© OpenStreetMap contributors'
+        }).addTo(map);
+
+        function fmtMoney(v) {
+            if (!v || v <= 0) return '';
+            if (v >= 1_000_000) return '$' + (v / 1_000_000).toFixed(2).replace(/\.?0+$/, '') + 'M';
+            if (v >= 1_000) return '$' + Math.round(v / 1000) + 'K';
+            return '$' + Math.round(v);
+        }
+        function fmtMoneyFull(v) {
+            if (!v || v <= 0) return 'n/a';
+            return '$' + Math.round(v).toLocaleString('en-US');
+        }
+        function zillowLink(m) {
+            const slug = [m.addr, m.city, m.state, m.zip]
+                .filter(x => x && String(x).trim().length > 0)
+                .join(' ')
+                .trim()
+                .replace(/\s+/g, '-');
+            return `https://www.zillow.com/homes/${encodeURI(slug)}_rb/`;
+        }
+
+        const bounds = [];
+        for (const m of markers) {
+            const priceShort = fmtMoney(m.marketValue);
+            const zUrl = zillowLink(m);
+            const popup =
+                `<b>${m.addr}</b><br/>` +
+                `${m.city}, ${m.state} ${m.zip}<br/>` +
+                `Width: ${m.width.toFixed(1)} ft, Depth: ${m.depth.toFixed(1)} ft<br/>` +
+                `Estimated Value: ${fmtMoneyFull(m.marketValue)}<br/>` +
+                (m.propwire ? `<a href="${m.propwire}" target="_blank">Propwire</a>` : '') +
+                (m.propwire ? ' &middot; ' : '') +
+                `<a href="${zUrl}" target="_blank">Zillow</a>`;
+            const marker = L.marker([m.lat, m.lon]).addTo(map).bindPopup(popup);
+            if (priceShort) {
+                marker.bindTooltip(priceShort, {
+                    permanent: true,
+                    direction: 'right',
+                    offset: [8, 0],
+                    className: 'price-label'
+                });
+            }
+            bounds.push([m.lat, m.lon]);
+        }
+        if (bounds.length > 1) map.fitBounds(bounds, { padding: [20, 20] });
+    </script>
+</body>
+</html>
+""";
+
+            Directory.CreateDirectory(Path.GetDirectoryName(mapHtml)!);
+            File.WriteAllText(mapHtml, html);
+            Console.WriteLine();
+            Console.WriteLine($"Wrote: {mapHtml}");
+            Console.WriteLine($"Markers: {markers.Count}");
+        }
+
+        static Dictionary<string, (double lat, double lon)> LoadGeocodeCache(string path)
+        {
+            var cache = new Dictionary<string, (double lat, double lon)>(StringComparer.OrdinalIgnoreCase);
+            if (!File.Exists(path)) return cache;
+
+            var rows = ReadCsv(path);
+            if (rows.Count < 2) return cache;
+
+            var header = rows[0];
+            int idIdx = header.FindIndex(h => h.Equals("Id", StringComparison.OrdinalIgnoreCase));
+            int latIdx = header.FindIndex(h => h.Equals("lat", StringComparison.OrdinalIgnoreCase));
+            int lonIdx = header.FindIndex(h => h.Equals("lon", StringComparison.OrdinalIgnoreCase));
+            if (idIdx < 0 || latIdx < 0 || lonIdx < 0) return cache;
+
+            for (int i = 1; i < rows.Count; i++)
+            {
+                var row = rows[i];
+                string id = Get(row, idIdx);
+                if (string.IsNullOrWhiteSpace(id)) continue;
+                if (!double.TryParse(Get(row, latIdx), NumberStyles.Float, CultureInfo.InvariantCulture, out double lat)) continue;
+                if (!double.TryParse(Get(row, lonIdx), NumberStyles.Float, CultureInfo.InvariantCulture, out double lon)) continue;
+                cache[id] = (lat, lon);
+            }
+            return cache;
+        }
+
+        static void SaveGeocodeCache(string path, Dictionary<string, (double lat, double lon)> cache)
+        {
+            var rows = new List<List<string>>
+            {
+                new List<string> { "Id", "lat", "lon" }
+            };
+            foreach (var kv in cache.OrderBy(k => k.Key))
+            {
+                rows.Add(new List<string>
+                {
+                    kv.Key,
+                    kv.Value.lat.ToString("G", CultureInfo.InvariantCulture),
+                    kv.Value.lon.ToString("G", CultureInfo.InvariantCulture)
+                });
+            }
+            WriteCsv(path, rows);
         }
 
         static string Get(List<string> row, int idx)
