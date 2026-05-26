@@ -1,14 +1,8 @@
-﻿using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.Globalization;
-using System.IO;
-using System.Linq;
-using System.Net.Http;
+﻿using System.Globalization;
 using System.Text;
 using System.Text.Json;
-using System.Threading;
-using System.Threading.Tasks;
+using System.Text.RegularExpressions;
+using Microsoft.Playwright;
 
 namespace ParcelFrontage
 {
@@ -39,6 +33,17 @@ namespace ParcelFrontage
                 double maxWidth = args.Length > 2 ? double.Parse(args[2], CultureInfo.InvariantCulture) : 80;
                 double maxValue = args.Length > 3 ? double.Parse(args[3], CultureInfo.InvariantCulture) : double.PositiveInfinity;
                 await MapMain(minWidth, maxWidth, maxValue);
+                return;
+            }
+
+            if (args.Length > 0 && args[0].Equals("redfin", StringComparison.OrdinalIgnoreCase))
+            {
+                int? limit = null;
+                if (args.Length > 1 && int.TryParse(args[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int n))
+                {
+                    limit = n;
+                }
+                await RedfinMain(limit);
                 return;
             }
 
@@ -242,6 +247,7 @@ namespace ParcelFrontage
             string outputCsv = Path.Combine(AppContext.BaseDirectory, "data", "lots_with_dimensions.csv");
             string sourceCsv = Path.Combine(AppContext.BaseDirectory, "data", "lots.csv");
             string geocodeCsv = Path.Combine(AppContext.BaseDirectory, "data", "geocodes.csv");
+            string redfinCsv = Path.Combine(AppContext.BaseDirectory, "data", "redfin_values.csv");
             string valueSuffix = double.IsPositiveInfinity(maxValue) ? "" : $"_lt{maxValue:F0}";
             string mapHtml = Path.Combine(AppContext.BaseDirectory, "data", $"map_{minWidth:F0}_{maxWidth:F0}{valueSuffix}.html");
 
@@ -279,6 +285,21 @@ namespace ParcelFrontage
                 Console.WriteLine($"Market value entries: {marketValueById.Count}");
             }
 
+            // Build Id -> Redfin Estimate lookup.
+            var redfinValueById = new Dictionary<string, (string url, double value)>(StringComparer.OrdinalIgnoreCase);
+            if (File.Exists(redfinCsv))
+            {
+                var rfCache = LoadRedfinCache(redfinCsv);
+                foreach (var kv in rfCache)
+                {
+                    if (kv.Value.status == "ok" && kv.Value.value > 0)
+                    {
+                        redfinValueById[kv.Key] = (kv.Value.url, kv.Value.value);
+                    }
+                }
+                Console.WriteLine($"Redfin estimate entries: {redfinValueById.Count}");
+            }
+
             var rows = ReadCsv(outputCsv);
             if (rows.Count < 2)
             {
@@ -303,7 +324,7 @@ namespace ParcelFrontage
             }
 
             // Filter rows by lot_width range.
-            var matches = new List<(string id, string addr, string city, string state, string zip, double width, double depth, string propwire, double marketValue)>();
+            var matches = new List<(string id, string addr, string city, string state, string zip, double width, double depth, string propwire, double marketValue, string redfinUrl, double redfinValue)>();
             for (int i = 1; i < rows.Count; i++)
             {
                 var row = rows[i];
@@ -321,6 +342,8 @@ namespace ParcelFrontage
                     if (mv <= 0 || mv >= maxValue) continue;
                 }
 
+                redfinValueById.TryGetValue(id, out var rf);
+
                 matches.Add((
                     id,
                     Get(row, addressIdx),
@@ -330,7 +353,9 @@ namespace ParcelFrontage
                     width,
                     depth,
                     Get(row, propwireIdx),
-                    mv
+                    mv,
+                    rf.url ?? "",
+                    rf.value
                 ));
             }
 
@@ -428,6 +453,8 @@ namespace ParcelFrontage
                         m.depth,
                         m.propwire,
                         m.marketValue,
+                        m.redfinUrl,
+                        m.redfinValue,
                         lat,
                         lon
                     };
@@ -503,16 +530,19 @@ namespace ParcelFrontage
 
         const bounds = [];
         for (const m of markers) {
-            const priceShort = fmtMoney(m.marketValue);
+            const displayValue = (m.redfinValue && m.redfinValue > 0) ? m.redfinValue : m.marketValue;
+            const priceShort = fmtMoney(displayValue);
             const zUrl = zillowLink(m);
             const popup =
                 `<b>${m.addr}</b><br/>` +
                 `${m.city}, ${m.state} ${m.zip}<br/>` +
                 `Width: ${m.width.toFixed(1)} ft, Depth: ${m.depth.toFixed(1)} ft<br/>` +
+                `Redfin Estimate: ${fmtMoneyFull(m.redfinValue)}<br/>` +
                 `Estimated Value: ${fmtMoneyFull(m.marketValue)}<br/>` +
                 (m.propwire ? `<a href="${m.propwire}" target="_blank">Propwire</a>` : '') +
                 (m.propwire ? ' &middot; ' : '') +
-                `<a href="${zUrl}" target="_blank">Zillow</a>`;
+                `<a href="${zUrl}" target="_blank">Zillow</a>` +
+                (m.redfinUrl ? ` &middot; <a href="${m.redfinUrl}" target="_blank">Redfin</a>` : '');
             const marker = L.marker([m.lat, m.lon]).addTo(map).bindPopup(popup);
             if (priceShort) {
                 marker.bindTooltip(priceShort, {
@@ -535,6 +565,361 @@ namespace ParcelFrontage
             Console.WriteLine();
             Console.WriteLine($"Wrote: {mapHtml}");
             Console.WriteLine($"Markers: {markers.Count}");
+        }
+
+        // -------------------------------------------------------------------
+        // REDFIN ESTIMATE SCRAPER
+        // -------------------------------------------------------------------
+        //
+        // Two-stage flow:
+        //   1) Use Playwright (Chromium) to resolve "Address, City, State Zip"
+        //      via Redfin's homepage search, which JS-redirects to the
+        //      property URL containing the home id.
+        //   2) Fetch that property page over plain HttpClient and parse the
+        //      Redfin Estimate value from the embedded bootstrap JSON.
+        //
+        // Results are persisted to data\redfin_values.csv with columns:
+        //   Id,redfin_url,redfin_value,status,fetched_at
+        // Statuses: ok | not_found | no_estimate | error
+        // On re-run, rows with status=ok|not_found are skipped; error and
+        // no_estimate rows are retried (the page may have changed).
+        //
+        // Concurrency is intentionally low (2) and we pace requests to be
+        // polite. Checkpoints every 25 rows make long runs restartable.
+
+        private const int RedfinConcurrency = 2;
+        private const int RedfinCheckpointEvery = 25;
+
+        private static readonly Regex RedfinValueRegex = new(
+            "\\\\?\"predictedValue\\\\?\"\\s*:\\s*(\\d+(?:\\.\\d+)?)",
+            RegexOptions.Compiled);
+
+        private static readonly Regex RedfinFallbackRegex = new(
+            "Redfin\\s+Estimate[^$]{0,200}\\$([0-9,]+)",
+            RegexOptions.Compiled);
+
+        private static readonly Regex RedfinHomeUrlRegex = new(
+            "https?://www\\.redfin\\.com/[A-Z]{2}/[^/\"\\s]+/[^/\"\\s]+/home/\\d+",
+            RegexOptions.Compiled);
+
+        static async Task RedfinMain(int? limit)
+        {
+            string dimsCsv = Path.Combine(AppContext.BaseDirectory, "data", "lots_with_dimensions.csv");
+            string redfinCsv = Path.Combine(AppContext.BaseDirectory, "data", "redfin_values.csv");
+
+            if (!File.Exists(dimsCsv))
+            {
+                Console.WriteLine($"Not found: {dimsCsv}");
+                Console.WriteLine("Run default mode first to produce lots_with_dimensions.csv.");
+                return;
+            }
+
+            var rows = ReadCsv(dimsCsv);
+            if (rows.Count < 2)
+            {
+                Console.WriteLine("Empty dimensions CSV.");
+                return;
+            }
+
+            var header = rows[0];
+            int idIdx = header.FindIndex(h => h.Equals("Id", StringComparison.OrdinalIgnoreCase));
+            int addressIdx = header.FindIndex(h => h.Equals("Address", StringComparison.OrdinalIgnoreCase));
+            int cityIdx = header.FindIndex(h => h.Equals("City", StringComparison.OrdinalIgnoreCase));
+            int stateIdx = header.FindIndex(h => h.Equals("State", StringComparison.OrdinalIgnoreCase));
+            int zipIdx = header.FindIndex(h => h.Equals("Zip", StringComparison.OrdinalIgnoreCase));
+            if (idIdx < 0 || addressIdx < 0)
+            {
+                Console.WriteLine("Required columns Id/Address missing.");
+                return;
+            }
+
+            var cache = LoadRedfinCache(redfinCsv);
+            Console.WriteLine($"Redfin cache entries: {cache.Count}");
+
+            // Rows that still need work: missing entry OR entry with status error/no_estimate (retry).
+            var todo = new List<(string id, string addr, string city, string state, string zip)>();
+            for (int i = 1; i < rows.Count; i++)
+            {
+                var row = rows[i];
+                string id = Get(row, idIdx);
+                string addr = Get(row, addressIdx);
+                if (string.IsNullOrWhiteSpace(id) || string.IsNullOrWhiteSpace(addr)) continue;
+
+                if (cache.TryGetValue(id, out var existing) &&
+                    (existing.status == "ok" || existing.status == "not_found"))
+                {
+                    continue;
+                }
+
+                todo.Add((id, addr, Get(row, cityIdx), Get(row, stateIdx), Get(row, zipIdx)));
+            }
+
+            if (limit.HasValue) todo = todo.Take(limit.Value).ToList();
+            Console.WriteLine($"To fetch: {todo.Count}");
+            if (todo.Count == 0)
+            {
+                Console.WriteLine("Nothing to do.");
+                return;
+            }
+
+            using var playwright = await Playwright.CreateAsync();
+            bool headless = Environment.GetEnvironmentVariable("REDFIN_HEADLESS") != "0";
+            await using var browser = await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
+            {
+                Headless = headless,
+                Args = new[]
+                {
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                }
+            });
+            var context = await browser.NewContextAsync(new BrowserNewContextOptions
+            {
+                UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+                ViewportSize = new ViewportSize { Width = 1280, Height = 800 },
+                Locale = "en-US",
+            });
+
+            // Hide webdriver flag, common bot-detection vector.
+            await context.AddInitScriptAsync(@"
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                window.chrome = { runtime: {} };
+                Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            ");
+
+            int done = 0, ok = 0, notFound = 0, noEstimate = 0, errors = 0;
+            int sinceSave = 0;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var lockObj = new object();
+
+            using var throttle = new SemaphoreSlim(RedfinConcurrency, RedfinConcurrency);
+
+            var tasks = todo.Select(async lot =>
+            {
+                await throttle.WaitAsync();
+                try
+                {
+                    var result = await FetchRedfinEstimateAsync(context, lot.addr, lot.city, lot.state, lot.zip);
+
+                    lock (lockObj)
+                    {
+                        cache[lot.id] = (result.url, result.value, result.status, DateTime.UtcNow);
+                        switch (result.status)
+                        {
+                            case "ok": ok++; break;
+                            case "not_found": notFound++; break;
+                            case "no_estimate": noEstimate++; break;
+                            default: errors++; break;
+                        }
+                    }
+
+                    int d = Interlocked.Increment(ref done);
+                    int s = Interlocked.Increment(ref sinceSave);
+
+                    if (d % 10 == 0 || d == todo.Count)
+                    {
+                        double rate = d / Math.Max(0.001, sw.Elapsed.TotalSeconds);
+                        int remaining = todo.Count - d;
+                        TimeSpan eta = TimeSpan.FromSeconds(remaining / Math.Max(0.001, rate));
+                        Console.WriteLine($"[{d}/{todo.Count}] ok={ok} notFound={notFound} noEst={noEstimate} err={errors} rate={rate:F2}/s eta={eta:hh\\:mm\\:ss}");
+                    }
+
+                    if (s >= RedfinCheckpointEvery)
+                    {
+                        lock (lockObj)
+                        {
+                            if (sinceSave >= RedfinCheckpointEvery)
+                            {
+                                sinceSave = 0;
+                                try { SaveRedfinCache(redfinCsv, cache); }
+                                catch (IOException) { /* skip if locked */ }
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    throttle.Release();
+                }
+            }).ToArray();
+
+            await Task.WhenAll(tasks);
+            SaveRedfinCache(redfinCsv, cache);
+
+            Console.WriteLine();
+            Console.WriteLine($"Done. ok={ok} not_found={notFound} no_estimate={noEstimate} errors={errors}");
+            Console.WriteLine($"Wrote: {redfinCsv}");
+        }
+
+        static async Task<(string url, double value, string status)> FetchRedfinEstimateAsync(
+            IBrowserContext context, string addr, string city, string state, string zip)
+        {
+            string fullAddress = string.Join(", ",
+                new[] { addr, city, state, zip }.Where(s => !string.IsNullOrWhiteSpace(s)));
+
+            string? finalUrl = null;
+            string pageHtml = "";
+            var page = await context.NewPageAsync();
+            try
+            {
+                try
+                {
+                    await page.GotoAsync("https://www.redfin.com/", new PageGotoOptions
+                    {
+                        WaitUntil = WaitUntilState.DOMContentLoaded,
+                        Timeout = 25000
+                    });
+                }
+                catch (Exception ex) when (ex is TimeoutException || ex is PlaywrightException)
+                {
+                    return ("", 0, "error");
+                }
+
+                try
+                {
+                    // Locate the homepage search box and type the address.
+                    var searchBox = page.Locator("input[name='searchInputBox'], input[data-rf-test-name='search-box-input'], input[placeholder*='Address'], input[type='search']").First;
+                    await searchBox.WaitForAsync(new LocatorWaitForOptions { Timeout = 15000 });
+                    await searchBox.ClickAsync();
+                    await searchBox.FillAsync(fullAddress);
+                    await Task.Delay(1500);
+
+                    // Wait for the autocomplete dropdown to appear and click the first row.
+                    var firstSuggestion = page.Locator("[id^='search-box-results-item-'], .search-result-row, .item-row").First;
+                    try
+                    {
+                        await firstSuggestion.WaitForAsync(new LocatorWaitForOptions { Timeout = 6000 });
+                        await firstSuggestion.ClickAsync();
+                    }
+                    catch (TimeoutException)
+                    {
+                        // Fall back to pressing Enter.
+                        await searchBox.PressAsync("Enter");
+                    }
+
+                    try
+                    {
+                        await page.WaitForURLAsync(new Regex(@"/home/\d+"), new PageWaitForURLOptions { Timeout = 15000 });
+                        finalUrl = page.Url;
+                    }
+                    catch (TimeoutException)
+                    {
+                        return ("", 0, "not_found");
+                    }
+                }
+                catch (Exception ex) when (ex is TimeoutException || ex is PlaywrightException)
+                {
+                    return ("", 0, "not_found");
+                }
+
+                if (string.IsNullOrEmpty(finalUrl)) return ("", 0, "not_found");
+
+                if (!string.IsNullOrWhiteSpace(zip) && !finalUrl.Contains(zip.Trim()))
+                {
+                    return (finalUrl, 0, "not_found");
+                }
+
+                // Strip query/fragment for the HttpClient fetch.
+                int qIdx = finalUrl.IndexOfAny(new[] { '?', '#' });
+                string cleanUrl = qIdx > 0 ? finalUrl.Substring(0, qIdx) : finalUrl;
+
+                using var req = new HttpRequestMessage(HttpMethod.Get, cleanUrl);
+                req.Headers.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36");
+                req.Headers.Accept.ParseAdd("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+                req.Headers.AcceptLanguage.ParseAdd("en-US,en;q=0.9");
+                req.Headers.Add("Upgrade-Insecure-Requests", "1");
+
+                try
+                {
+                    using var httpResp = await Http.SendAsync(req);
+                    if (!httpResp.IsSuccessStatusCode)
+                    {
+                        return (cleanUrl, 0, "error");
+                    }
+                    pageHtml = await httpResp.Content.ReadAsStringAsync();
+                }
+                catch (Exception)
+                {
+                    return (cleanUrl, 0, "error");
+                }
+
+                finalUrl = cleanUrl;
+            }
+            finally
+            {
+                await page.CloseAsync();
+            }
+
+            // Parse "predictedValue":<number> — the most stable embedded JSON token.
+            var match = RedfinValueRegex.Match(pageHtml);
+            if (match.Success &&
+                double.TryParse(match.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out double v) &&
+                v > 0)
+            {
+                return (finalUrl, v, "ok");
+            }
+
+            // Fallback: "Redfin Estimate ... $1,234,567" in visible text.
+            var fallback = RedfinFallbackRegex.Match(pageHtml);
+            if (fallback.Success &&
+                double.TryParse(fallback.Groups[1].Value.Replace(",", ""), NumberStyles.Float, CultureInfo.InvariantCulture, out double fv) &&
+                fv > 0)
+            {
+                return (finalUrl, fv, "ok");
+            }
+
+            return (finalUrl, 0, "no_estimate");
+        }
+
+        static Dictionary<string, (string url, double value, string status, DateTime fetchedAt)> LoadRedfinCache(string path)
+        {
+            var cache = new Dictionary<string, (string url, double value, string status, DateTime fetchedAt)>(StringComparer.OrdinalIgnoreCase);
+            if (!File.Exists(path)) return cache;
+
+            var rows = ReadCsv(path);
+            if (rows.Count < 2) return cache;
+
+            var header = rows[0];
+            int idIdx = header.FindIndex(h => h.Equals("Id", StringComparison.OrdinalIgnoreCase));
+            int urlIdx = header.FindIndex(h => h.Equals("redfin_url", StringComparison.OrdinalIgnoreCase));
+            int valIdx = header.FindIndex(h => h.Equals("redfin_value", StringComparison.OrdinalIgnoreCase));
+            int statusIdx = header.FindIndex(h => h.Equals("status", StringComparison.OrdinalIgnoreCase));
+            int tsIdx = header.FindIndex(h => h.Equals("fetched_at", StringComparison.OrdinalIgnoreCase));
+            if (idIdx < 0) return cache;
+
+            for (int i = 1; i < rows.Count; i++)
+            {
+                var row = rows[i];
+                string id = Get(row, idIdx);
+                if (string.IsNullOrWhiteSpace(id)) continue;
+                string url = Get(row, urlIdx);
+                double.TryParse(Get(row, valIdx), NumberStyles.Float, CultureInfo.InvariantCulture, out double v);
+                string status = Get(row, statusIdx);
+                DateTime.TryParse(Get(row, tsIdx), CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out DateTime ts);
+                cache[id] = (url, v, status, ts);
+            }
+            return cache;
+        }
+
+        static void SaveRedfinCache(string path, Dictionary<string, (string url, double value, string status, DateTime fetchedAt)> cache)
+        {
+            var rows = new List<List<string>>
+            {
+                new List<string> { "Id", "redfin_url", "redfin_value", "status", "fetched_at" }
+            };
+            foreach (var kv in cache.OrderBy(k => k.Key))
+            {
+                rows.Add(new List<string>
+                {
+                    kv.Key,
+                    kv.Value.url ?? "",
+                    kv.Value.value > 0 ? kv.Value.value.ToString("F0", CultureInfo.InvariantCulture) : "",
+                    kv.Value.status ?? "",
+                    kv.Value.fetchedAt == default ? "" : kv.Value.fetchedAt.ToString("O", CultureInfo.InvariantCulture)
+                });
+            }
+            WriteCsv(path, rows);
         }
 
         static Dictionary<string, (double lat, double lon)> LoadGeocodeCache(string path)
