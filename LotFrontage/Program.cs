@@ -32,7 +32,8 @@ namespace ParcelFrontage
                 double minWidth = args.Length > 1 ? double.Parse(args[1], CultureInfo.InvariantCulture) : 50;
                 double maxWidth = args.Length > 2 ? double.Parse(args[2], CultureInfo.InvariantCulture) : 80;
                 double maxValue = args.Length > 3 ? double.Parse(args[3], CultureInfo.InvariantCulture) : double.PositiveInfinity;
-                await MapMain(minWidth, maxWidth, maxValue);
+                bool useRedfin = args.Length > 4 && args[4].Equals("redfin", StringComparison.OrdinalIgnoreCase);
+                await MapMain(minWidth, maxWidth, maxValue, useRedfin);
                 return;
             }
 
@@ -242,14 +243,15 @@ namespace ParcelFrontage
         // MAP MODE
         // -------------------------------------------------------------------
 
-        static async Task MapMain(double minWidth, double maxWidth, double maxValue = double.PositiveInfinity)
+        static async Task MapMain(double minWidth, double maxWidth, double maxValue = double.PositiveInfinity, bool useRedfinValue = false)
         {
             string outputCsv = Path.Combine(AppContext.BaseDirectory, "data", "lots_with_dimensions.csv");
             string sourceCsv = Path.Combine(AppContext.BaseDirectory, "data", "lots.csv");
             string geocodeCsv = Path.Combine(AppContext.BaseDirectory, "data", "geocodes.csv");
             string redfinCsv = Path.Combine(AppContext.BaseDirectory, "data", "redfin_values.csv");
             string valueSuffix = double.IsPositiveInfinity(maxValue) ? "" : $"_lt{maxValue:F0}";
-            string mapHtml = Path.Combine(AppContext.BaseDirectory, "data", $"map_{minWidth:F0}_{maxWidth:F0}{valueSuffix}.html");
+            string sourceSuffix = useRedfinValue ? "_redfin" : "";
+            string mapHtml = Path.Combine(AppContext.BaseDirectory, "data", $"map_{minWidth:F0}_{maxWidth:F0}{valueSuffix}{sourceSuffix}.html");
 
             if (!File.Exists(outputCsv))
             {
@@ -336,13 +338,18 @@ namespace ParcelFrontage
 
                 string id = Get(row, idIdx);
                 marketValueById.TryGetValue(id, out double mv);
+                redfinValueById.TryGetValue(id, out var rf);
 
                 if (!double.IsPositiveInfinity(maxValue))
                 {
-                    if (mv <= 0 || mv >= maxValue) continue;
+                    double filterValue = useRedfinValue ? rf.value : mv;
+                    if (filterValue <= 0 || filterValue >= maxValue) continue;
                 }
-
-                redfinValueById.TryGetValue(id, out var rf);
+                else if (useRedfinValue && rf.value <= 0)
+                {
+                    // When filtering by Redfin, require a Redfin value even with no max.
+                    continue;
+                }
 
                 matches.Add((
                     id,
