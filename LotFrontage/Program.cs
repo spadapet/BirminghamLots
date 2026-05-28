@@ -37,6 +37,13 @@ namespace ParcelFrontage
                 return;
             }
 
+            if (args.Length > 0 && args[0].Equals("mapi", StringComparison.OrdinalIgnoreCase))
+            {
+                double minWidth = args.Length > 1 ? double.Parse(args[1], CultureInfo.InvariantCulture) : 55;
+                await MapInteractiveMain(minWidth);
+                return;
+            }
+
             if (args.Length > 0 && args[0].Equals("redfin", StringComparison.OrdinalIgnoreCase))
             {
                 int? limit = null;
@@ -572,6 +579,363 @@ namespace ParcelFrontage
             Console.WriteLine();
             Console.WriteLine($"Wrote: {mapHtml}");
             Console.WriteLine($"Markers: {markers.Count}");
+        }
+
+        // -------------------------------------------------------------------
+        // INTERACTIVE MAP MODE
+        // -------------------------------------------------------------------
+        //
+        // Bakes every lot at or above `floorWidth` into a single HTML file
+        // with client-side filter controls (min/max width, min/max value,
+        // and a Redfin vs Estimated Value source toggle). Re-running is not
+        // needed to change filters — just edit the controls in the browser.
+        //
+
+        static async Task MapInteractiveMain(double floorWidth)
+        {
+            string outputCsv = Path.Combine(AppContext.BaseDirectory, "data", "lots_with_dimensions.csv");
+            string sourceCsv = Path.Combine(AppContext.BaseDirectory, "data", "lots.csv");
+            string geocodeCsv = Path.Combine(AppContext.BaseDirectory, "data", "geocodes.csv");
+            string redfinCsv = Path.Combine(AppContext.BaseDirectory, "data", "redfin_values.csv");
+            string mapHtml = Path.Combine(AppContext.BaseDirectory, "data", $"map_interactive_{floorWidth:F0}.html");
+
+            if (!File.Exists(outputCsv))
+            {
+                Console.WriteLine($"Output CSV not found: {outputCsv}");
+                return;
+            }
+
+            // Estimated Value lookup.
+            var marketValueById = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+            if (File.Exists(sourceCsv))
+            {
+                var srcRows = ReadCsv(sourceCsv);
+                if (srcRows.Count >= 2)
+                {
+                    var sh = srcRows[0];
+                    int idI = sh.FindIndex(h => h.Equals("Id", StringComparison.OrdinalIgnoreCase));
+                    int mvI = sh.FindIndex(h => h.Equals("Estimated Value", StringComparison.OrdinalIgnoreCase));
+                    if (idI >= 0 && mvI >= 0)
+                    {
+                        for (int i = 1; i < srcRows.Count; i++)
+                        {
+                            var r = srcRows[i];
+                            string id = Get(r, idI);
+                            if (string.IsNullOrWhiteSpace(id)) continue;
+                            if (double.TryParse(Get(r, mvI), NumberStyles.Float, CultureInfo.InvariantCulture, out double mv) && mv > 0)
+                                marketValueById[id] = mv;
+                        }
+                    }
+                }
+            }
+            Console.WriteLine($"Estimated Value entries: {marketValueById.Count}");
+
+            // Redfin lookup.
+            var redfinValueById = new Dictionary<string, (string url, double value)>(StringComparer.OrdinalIgnoreCase);
+            if (File.Exists(redfinCsv))
+            {
+                var rfCache = LoadRedfinCache(redfinCsv);
+                foreach (var kv in rfCache)
+                {
+                    if (kv.Value.status == "ok" && kv.Value.value > 0)
+                        redfinValueById[kv.Key] = (kv.Value.url, kv.Value.value);
+                }
+            }
+            Console.WriteLine($"Redfin estimate entries: {redfinValueById.Count}");
+
+            var rows = ReadCsv(outputCsv);
+            if (rows.Count < 2)
+            {
+                Console.WriteLine("Output CSV is empty.");
+                return;
+            }
+
+            var header = rows[0];
+            int idIdx = header.FindIndex(h => h.Equals("Id", StringComparison.OrdinalIgnoreCase));
+            int addressIdx = header.FindIndex(h => h.Equals("Address", StringComparison.OrdinalIgnoreCase));
+            int cityIdx = header.FindIndex(h => h.Equals("City", StringComparison.OrdinalIgnoreCase));
+            int stateIdx = header.FindIndex(h => h.Equals("State", StringComparison.OrdinalIgnoreCase));
+            int zipIdx = header.FindIndex(h => h.Equals("Zip", StringComparison.OrdinalIgnoreCase));
+            int widthIdx = header.FindIndex(h => h.Equals("lot_width", StringComparison.OrdinalIgnoreCase));
+            int depthIdx = header.FindIndex(h => h.Equals("lot_depth", StringComparison.OrdinalIgnoreCase));
+            int propwireIdx = header.FindIndex(h => h.Equals("propwire_link", StringComparison.OrdinalIgnoreCase));
+
+            if (widthIdx < 0 || addressIdx < 0)
+            {
+                Console.WriteLine("Required columns missing.");
+                return;
+            }
+
+            var matches = new List<(string id, string addr, string city, string state, string zip,
+                double width, double depth, string propwire, double marketValue, string redfinUrl, double redfinValue)>();
+            for (int i = 1; i < rows.Count; i++)
+            {
+                var row = rows[i];
+                if (!double.TryParse(Get(row, widthIdx), NumberStyles.Float, CultureInfo.InvariantCulture, out double width)) continue;
+                if (width < floorWidth) continue;
+
+                double.TryParse(Get(row, depthIdx), NumberStyles.Float, CultureInfo.InvariantCulture, out double depth);
+
+                string id = Get(row, idIdx);
+                marketValueById.TryGetValue(id, out double mv);
+                redfinValueById.TryGetValue(id, out var rf);
+
+                matches.Add((
+                    id, Get(row, addressIdx), Get(row, cityIdx), Get(row, stateIdx), Get(row, zipIdx),
+                    width, depth, Get(row, propwireIdx), mv, rf.url ?? "", rf.value));
+            }
+            Console.WriteLine($"Lots with width >= {floorWidth}: {matches.Count}");
+
+            var geocodeCache = LoadGeocodeCache(geocodeCsv);
+            Console.WriteLine($"Geocode cache entries: {geocodeCache.Count}");
+
+            var toGeocode = matches.Where(m => !geocodeCache.ContainsKey(m.id)).ToList();
+            Console.WriteLine($"To geocode: {toGeocode.Count}");
+
+            if (toGeocode.Count > 0)
+            {
+                using var throttle = new SemaphoreSlim(MaxConcurrency, MaxConcurrency);
+                int done = 0;
+                int errors = 0;
+                var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+                var lockObj = new object();
+                int sinceSave = 0;
+
+                var tasks = toGeocode.Select(async m =>
+                {
+                    await throttle.WaitAsync();
+                    try
+                    {
+                        string fullAddress = string.Join(", ",
+                            new[] { m.addr, m.city, m.state, m.zip }
+                                .Where(s => !string.IsNullOrWhiteSpace(s)));
+                        try
+                        {
+                            var (lon, lat) = await GeocodeAddress(fullAddress, locationType: null);
+                            lock (lockObj) geocodeCache[m.id] = (lat, lon);
+                        }
+                        catch (Exception ex)
+                        {
+                            Interlocked.Increment(ref errors);
+                            Console.WriteLine($"  ERROR ({fullAddress}): {ex.Message}");
+                        }
+                        int d = Interlocked.Increment(ref done);
+                        int s = Interlocked.Increment(ref sinceSave);
+                        if (d % 50 == 0 || d == toGeocode.Count)
+                        {
+                            double rate = d / Math.Max(0.001, stopwatch.Elapsed.TotalSeconds);
+                            Console.WriteLine($"[{d}/{toGeocode.Count}] errors: {errors}, rate: {rate:F1}/s");
+                        }
+                        if (s >= 250)
+                        {
+                            lock (lockObj)
+                            {
+                                if (sinceSave >= 250)
+                                {
+                                    sinceSave = 0;
+                                    try { SaveGeocodeCache(geocodeCsv, geocodeCache); }
+                                    catch (IOException) { }
+                                }
+                            }
+                        }
+                    }
+                    finally { throttle.Release(); }
+                }).ToArray();
+
+                await Task.WhenAll(tasks);
+                SaveGeocodeCache(geocodeCsv, geocodeCache);
+                Console.WriteLine($"Geocoded {done} addresses ({errors} errors).");
+            }
+
+            var markers = matches
+                .Where(m => geocodeCache.ContainsKey(m.id))
+                .Select(m =>
+                {
+                    var (lat, lon) = geocodeCache[m.id];
+                    return new
+                    {
+                        m.id,
+                        m.addr,
+                        m.city,
+                        m.state,
+                        m.zip,
+                        m.width,
+                        m.depth,
+                        m.propwire,
+                        m.marketValue,
+                        m.redfinUrl,
+                        m.redfinValue,
+                        lat,
+                        lon
+                    };
+                })
+                .ToList();
+
+            if (markers.Count == 0)
+            {
+                Console.WriteLine("No geocoded markers to plot.");
+                return;
+            }
+
+            double centerLat = markers.Average(m => m.lat);
+            double centerLon = markers.Average(m => m.lon);
+            var markersJson = JsonSerializer.Serialize(markers);
+
+            string html = $$"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>Birmingham Lots — Interactive</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        html, body { margin: 0; height: 100%; font-family: sans-serif; }
+        #map { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
+        #controls {
+            position: absolute; top: 10px; left: 10px; z-index: 1000;
+            background: rgba(255,255,255,0.95); padding: 10px 12px;
+            border: 1px solid #ccc; border-radius: 6px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.2); font-size: 13px;
+            min-width: 230px;
+        }
+        #controls h3 { margin: 0 0 8px 0; font-size: 14px; }
+        #controls label { display: inline-block; width: 70px; }
+        #controls input[type=number] { width: 90px; padding: 2px 4px; }
+        #controls .row { margin-bottom: 6px; }
+        #controls .src { margin-top: 8px; }
+        #count { font-weight: 600; color: #1a73e8; margin-top: 6px; }
+        .leaflet-popup-content { font-size: 13px; }
+        .leaflet-popup-content a { color: #1a73e8; text-decoration: none; }
+        .price-label {
+            background: rgba(255,255,255,0.92);
+            border: 1px solid #1a73e8;
+            border-radius: 4px;
+            padding: 1px 4px;
+            font-size: 11px;
+            font-weight: 600;
+            color: #1a73e8;
+            white-space: nowrap;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.15);
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <div id="controls">
+        <h3>Filters</h3>
+        <div class="row"><label>Min width</label><input type="number" id="minW" value="{{floorWidth.ToString("G", CultureInfo.InvariantCulture)}}" step="1"> ft</div>
+        <div class="row"><label>Max width</label><input type="number" id="maxW" value="" placeholder="any" step="1"> ft</div>
+        <div class="row"><label>Min value</label><input type="number" id="minV" value="" placeholder="any" step="10000"> $</div>
+        <div class="row"><label>Max value</label><input type="number" id="maxV" value="850000" step="10000"> $</div>
+        <div class="src">
+            Value source:
+            <label style="width:auto"><input type="radio" name="src" value="redfin" checked> Redfin</label>
+            <label style="width:auto"><input type="radio" name="src" value="market"> Estimated</label>
+        </div>
+        <div class="row" style="margin-top:8px">
+            <label style="width:auto"><input type="checkbox" id="requireValue" checked> Require value</label>
+        </div>
+        <div id="count">0 lots shown</div>
+    </div>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        const ALL = {{markersJson}};
+        const map = L.map('map').setView([{{centerLat.ToString("G", CultureInfo.InvariantCulture)}}, {{centerLon.ToString("G", CultureInfo.InvariantCulture)}}], 13);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '© OpenStreetMap contributors'
+        }).addTo(map);
+
+        const layer = L.layerGroup().addTo(map);
+
+        function fmtMoney(v) {
+            if (!v || v <= 0) return '';
+            if (v >= 1_000_000) return '$' + (v / 1_000_000).toFixed(2).replace(/\.?0+$/, '') + 'M';
+            if (v >= 1_000) return '$' + Math.round(v / 1000) + 'K';
+            return '$' + Math.round(v);
+        }
+        function fmtMoneyFull(v) {
+            if (!v || v <= 0) return 'n/a';
+            return '$' + Math.round(v).toLocaleString('en-US');
+        }
+        function zillowLink(m) {
+            const slug = [m.addr, m.city, m.state, m.zip]
+                .filter(x => x && String(x).trim().length > 0)
+                .join(' ').trim().replace(/\s+/g, '-');
+            return `https://www.zillow.com/homes/${encodeURI(slug)}_rb/`;
+        }
+        function valueOf(m, src) {
+            return src === 'redfin' ? (m.redfinValue || 0) : (m.marketValue || 0);
+        }
+
+        function render() {
+            const minW = parseFloat(document.getElementById('minW').value);
+            const maxWRaw = document.getElementById('maxW').value;
+            const maxW = maxWRaw === '' ? Infinity : parseFloat(maxWRaw);
+            const minVRaw = document.getElementById('minV').value;
+            const minV = minVRaw === '' ? 0 : parseFloat(minVRaw);
+            const maxVRaw = document.getElementById('maxV').value;
+            const maxV = maxVRaw === '' ? Infinity : parseFloat(maxVRaw);
+            const src = document.querySelector('input[name=src]:checked').value;
+            const requireValue = document.getElementById('requireValue').checked;
+
+            layer.clearLayers();
+            let n = 0;
+            for (const m of ALL) {
+                if (!isNaN(minW) && m.width < minW) continue;
+                if (!isNaN(maxW) && m.width > maxW) continue;
+                const v = valueOf(m, src);
+                if (requireValue && v <= 0) continue;
+                if (v > 0) {
+                    if (v < minV) continue;
+                    if (v > maxV) continue;
+                } else {
+                    // no value: include only if neither min nor max value is set
+                    if (minV > 0 || isFinite(maxV)) continue;
+                }
+                const priceShort = fmtMoney(v);
+                const zUrl = zillowLink(m);
+                const popup =
+                    `<b>${m.addr}</b><br/>` +
+                    `${m.city}, ${m.state} ${m.zip}<br/>` +
+                    `Width: ${m.width.toFixed(1)} ft, Depth: ${m.depth.toFixed(1)} ft<br/>` +
+                    `Redfin Estimate: ${fmtMoneyFull(m.redfinValue)}<br/>` +
+                    `Estimated Value: ${fmtMoneyFull(m.marketValue)}<br/>` +
+                    (m.propwire ? `<a href="${m.propwire}" target="_blank">Propwire</a> &middot; ` : '') +
+                    `<a href="${zUrl}" target="_blank">Zillow</a>` +
+                    (m.redfinUrl ? ` &middot; <a href="${m.redfinUrl}" target="_blank">Redfin</a>` : '');
+                const marker = L.marker([m.lat, m.lon]).bindPopup(popup);
+                if (priceShort) {
+                    marker.bindTooltip(priceShort, {
+                        permanent: true,
+                        direction: 'right',
+                        offset: [8, 0],
+                        className: 'price-label'
+                    });
+                }
+                layer.addLayer(marker);
+                n++;
+            }
+            document.getElementById('count').textContent = n.toLocaleString('en-US') + ' lots shown (of ' + ALL.length.toLocaleString('en-US') + ')';
+        }
+
+        for (const id of ['minW','maxW','minV','maxV','requireValue']) {
+            document.getElementById(id).addEventListener('input', render);
+            document.getElementById(id).addEventListener('change', render);
+        }
+        for (const r of document.querySelectorAll('input[name=src]')) r.addEventListener('change', render);
+
+        render();
+    </script>
+</body>
+</html>
+""";
+
+            Directory.CreateDirectory(Path.GetDirectoryName(mapHtml)!);
+            File.WriteAllText(mapHtml, html);
+            Console.WriteLine();
+            Console.WriteLine($"Wrote: {mapHtml}");
+            Console.WriteLine($"Baked markers: {markers.Count}");
         }
 
         // -------------------------------------------------------------------
