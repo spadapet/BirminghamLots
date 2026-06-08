@@ -517,7 +517,8 @@ namespace ParcelFrontage
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script>
         const markers = {{markersJson}};
-        const map = L.map('map').setView([{{centerLat.ToString("G", CultureInfo.InvariantCulture)}}, {{centerLon.ToString("G", CultureInfo.InvariantCulture)}}], 14);
+        const map = L.map('map', { zoomControl: false }).setView([{{centerLat.ToString("G", CultureInfo.InvariantCulture)}}, {{centerLon.ToString("G", CultureInfo.InvariantCulture)}}], 14);
+        L.control.zoom({ position: 'topright' }).addTo(map);
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
             maxZoom: 19,
             attribution: '© OpenStreetMap contributors'
@@ -843,7 +844,8 @@ namespace ParcelFrontage
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script>
         const ALL = {{markersJson}};
-        const map = L.map('map', { preferCanvas: true }).setView([{{centerLat.ToString("G", CultureInfo.InvariantCulture)}}, {{centerLon.ToString("G", CultureInfo.InvariantCulture)}}], 13);
+        const map = L.map('map', { preferCanvas: true, zoomControl: false }).setView([{{centerLat.ToString("G", CultureInfo.InvariantCulture)}}, {{centerLon.ToString("G", CultureInfo.InvariantCulture)}}], 13);
+        L.control.zoom({ position: 'topright' }).addTo(map);
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
             maxZoom: 19,
             attribution: '© OpenStreetMap contributors'
