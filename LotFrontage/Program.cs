@@ -823,10 +823,10 @@ namespace ParcelFrontage
     <div id="map"></div>
     <div id="controls">
         <h3>Filters</h3>
-        <div class="row"><label>Min width</label><input type="number" id="minW" value="{{floorWidth.ToString("G", CultureInfo.InvariantCulture)}}" step="1"> ft</div>
-        <div class="row"><label>Max width</label><input type="number" id="maxW" value="" placeholder="any" step="1"> ft</div>
-        <div class="row"><label>Min value</label><input type="number" id="minV" value="" placeholder="any" step="10000"> $</div>
-        <div class="row"><label>Max value</label><input type="number" id="maxV" value="850000" step="10000"> $</div>
+        <div class="row"><label>Min width</label><input type="number" id="minW" value="58" step="1"> ft</div>
+        <div class="row"><label>Max width</label><input type="number" id="maxW" value="100" placeholder="any" step="1"> ft</div>
+        <div class="row"><label>Min value</label><input type="number" id="minV" value="0" placeholder="any" step="10000"> $</div>
+        <div class="row"><label>Max value</label><input type="number" id="maxV" value="800000" step="10000"> $</div>
         <div class="src">
             Value source:
             <label style="width:auto"><input type="radio" name="src" value="redfin" checked> Redfin</label>
@@ -835,12 +835,15 @@ namespace ParcelFrontage
         <div class="row" style="margin-top:8px">
             <label style="width:auto"><input type="checkbox" id="requireValue" checked> Require value</label>
         </div>
+        <div class="row">
+            <label style="width:auto"><input type="checkbox" id="showLabels" checked> Show price labels</label>
+        </div>
         <div id="count">0 lots shown</div>
     </div>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script>
         const ALL = {{markersJson}};
-        const map = L.map('map').setView([{{centerLat.ToString("G", CultureInfo.InvariantCulture)}}, {{centerLon.ToString("G", CultureInfo.InvariantCulture)}}], 13);
+        const map = L.map('map', { preferCanvas: true }).setView([{{centerLat.ToString("G", CultureInfo.InvariantCulture)}}, {{centerLon.ToString("G", CultureInfo.InvariantCulture)}}], 13);
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
             maxZoom: 19,
             attribution: '© OpenStreetMap contributors'
@@ -868,32 +871,17 @@ namespace ParcelFrontage
             return src === 'redfin' ? (m.redfinValue || 0) : (m.marketValue || 0);
         }
 
-        function render() {
-            const minW = parseFloat(document.getElementById('minW').value);
-            const maxWRaw = document.getElementById('maxW').value;
-            const maxW = maxWRaw === '' ? Infinity : parseFloat(maxWRaw);
-            const minVRaw = document.getElementById('minV').value;
-            const minV = minVRaw === '' ? 0 : parseFloat(minVRaw);
-            const maxVRaw = document.getElementById('maxV').value;
-            const maxV = maxVRaw === '' ? Infinity : parseFloat(maxVRaw);
-            const src = document.querySelector('input[name=src]:checked').value;
-            const requireValue = document.getElementById('requireValue').checked;
-
-            layer.clearLayers();
-            let n = 0;
-            for (const m of ALL) {
-                if (!isNaN(minW) && m.width < minW) continue;
-                if (!isNaN(maxW) && m.width > maxW) continue;
-                const v = valueOf(m, src);
-                if (requireValue && v <= 0) continue;
-                if (v > 0) {
-                    if (v < minV) continue;
-                    if (v > maxV) continue;
-                } else {
-                    // no value: include only if neither min nor max value is set
-                    if (minV > 0 || isFinite(maxV)) continue;
-                }
-                const priceShort = fmtMoney(v);
+        // Pre-build one Leaflet marker per lot ONCE. Popups are bound lazily
+        // (built on first open) and the permanent price tooltip is created
+        // once. Filtering only adds/removes markers from the layer, so no
+        // DOM is recreated and there is no per-keystroke teardown cost.
+        let labelsOn = true;
+        function buildMarker(m) {
+            const marker = L.marker([m.lat, m.lon]);
+            marker._lot = m;
+            marker.on('popupopen', function () {
+                if (marker._popupBuilt) return;
+                marker._popupBuilt = true;
                 const zUrl = zillowLink(m);
                 const popup =
                     `<b>${m.addr}</b><br/>` +
@@ -904,26 +892,89 @@ namespace ParcelFrontage
                     (m.propwire ? `<a href="${m.propwire}" target="_blank">Propwire</a> &middot; ` : '') +
                     `<a href="${zUrl}" target="_blank">Zillow</a>` +
                     (m.redfinUrl ? ` &middot; <a href="${m.redfinUrl}" target="_blank">Redfin</a>` : '');
-                const marker = L.marker([m.lat, m.lon]).bindPopup(popup);
-                if (priceShort) {
-                    marker.bindTooltip(priceShort, {
-                        permanent: true,
-                        direction: 'right',
-                        offset: [8, 0],
-                        className: 'price-label'
-                    });
+                marker.setPopupContent(popup);
+            });
+            marker.bindPopup('…');
+            return marker;
+        }
+        for (const m of ALL) m._marker = buildMarker(m);
+
+        function applyLabel(m, src) {
+            const marker = m._marker;
+            if (!labelsOn) {
+                if (marker._hasTip) { marker.unbindTooltip(); marker._hasTip = false; marker._tipVal = undefined; }
+                return;
+            }
+            const v = valueOf(m, src);
+            const txt = fmtMoney(v);
+            if (!txt) {
+                if (marker._hasTip) { marker.unbindTooltip(); marker._hasTip = false; marker._tipVal = undefined; }
+                return;
+            }
+            if (marker._tipVal === txt) return; // unchanged, skip DOM work
+            marker.unbindTooltip();
+            marker.bindTooltip(txt, {
+                permanent: true,
+                direction: 'right',
+                offset: [8, 0],
+                className: 'price-label'
+            });
+            marker._hasTip = true;
+            marker._tipVal = txt;
+        }
+
+        function render() {
+            const minW = parseFloat(document.getElementById('minW').value);
+            const maxWRaw = document.getElementById('maxW').value;
+            const maxW = maxWRaw === '' ? Infinity : parseFloat(maxWRaw);
+            const minVRaw = document.getElementById('minV').value;
+            const minV = minVRaw === '' ? 0 : parseFloat(minVRaw);
+            const maxVRaw = document.getElementById('maxV').value;
+            const maxV = maxVRaw === '' ? Infinity : parseFloat(maxVRaw);
+            const src = document.querySelector('input[name=src]:checked').value;
+            const requireValue = document.getElementById('requireValue').checked;
+            labelsOn = document.getElementById('showLabels').checked;
+
+            let n = 0;
+            for (const m of ALL) {
+                let show = true;
+                if (!isNaN(minW) && m.width < minW) show = false;
+                else if (!isNaN(maxW) && m.width > maxW) show = false;
+                else {
+                    const v = valueOf(m, src);
+                    if (requireValue && v <= 0) show = false;
+                    else if (v > 0) {
+                        if (v < minV || v > maxV) show = false;
+                    } else if (minV > 0 || isFinite(maxV)) {
+                        show = false;
+                    }
                 }
-                layer.addLayer(marker);
-                n++;
+
+                const marker = m._marker;
+                if (show) {
+                    applyLabel(m, src);
+                    if (!marker._shown) { layer.addLayer(marker); marker._shown = true; }
+                    n++;
+                } else if (marker._shown) {
+                    layer.removeLayer(marker);
+                    marker._shown = false;
+                }
             }
             document.getElementById('count').textContent = n.toLocaleString('en-US') + ' lots shown (of ' + ALL.length.toLocaleString('en-US') + ')';
         }
 
-        for (const id of ['minW','maxW','minV','maxV','requireValue']) {
-            document.getElementById(id).addEventListener('input', render);
-            document.getElementById(id).addEventListener('change', render);
+        // Debounce so fast typing coalesces into a single render.
+        let renderTimer = null;
+        function scheduleRender() {
+            if (renderTimer) clearTimeout(renderTimer);
+            renderTimer = setTimeout(() => { renderTimer = null; render(); }, 120);
         }
-        for (const r of document.querySelectorAll('input[name=src]')) r.addEventListener('change', render);
+
+        for (const id of ['minW','maxW','minV','maxV','requireValue','showLabels']) {
+            document.getElementById(id).addEventListener('input', scheduleRender);
+            document.getElementById(id).addEventListener('change', scheduleRender);
+        }
+        for (const r of document.querySelectorAll('input[name=src]')) r.addEventListener('change', scheduleRender);
 
         render();
     </script>
