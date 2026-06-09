@@ -606,8 +606,9 @@ namespace ParcelFrontage
                 return;
             }
 
-            // Estimated Value lookup.
+            // Estimated Value + Owner lookup (both from the source CSV).
             var marketValueById = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+            var ownerById = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             if (File.Exists(sourceCsv))
             {
                 var srcRows = ReadCsv(sourceCsv);
@@ -616,6 +617,10 @@ namespace ParcelFrontage
                     var sh = srcRows[0];
                     int idI = sh.FindIndex(h => h.Equals("Id", StringComparison.OrdinalIgnoreCase));
                     int mvI = sh.FindIndex(h => h.Equals("Estimated Value", StringComparison.OrdinalIgnoreCase));
+                    int o1f = sh.FindIndex(h => h.Equals("Owner 1 First Name", StringComparison.OrdinalIgnoreCase));
+                    int o1l = sh.FindIndex(h => h.Equals("Owner 1 Last Name", StringComparison.OrdinalIgnoreCase));
+                    int o2f = sh.FindIndex(h => h.Equals("Owner 2 First Name", StringComparison.OrdinalIgnoreCase));
+                    int o2l = sh.FindIndex(h => h.Equals("Owner 2 Last Name", StringComparison.OrdinalIgnoreCase));
                     if (idI >= 0 && mvI >= 0)
                     {
                         for (int i = 1; i < srcRows.Count; i++)
@@ -625,11 +630,16 @@ namespace ParcelFrontage
                             if (string.IsNullOrWhiteSpace(id)) continue;
                             if (double.TryParse(Get(r, mvI), NumberStyles.Float, CultureInfo.InvariantCulture, out double mv) && mv > 0)
                                 marketValueById[id] = mv;
+
+                            string owner = FormatOwner(Get(r, o1f), Get(r, o1l), Get(r, o2f), Get(r, o2l));
+                            if (!string.IsNullOrWhiteSpace(owner))
+                                ownerById[id] = owner;
                         }
                     }
                 }
             }
             Console.WriteLine($"Estimated Value entries: {marketValueById.Count}");
+            Console.WriteLine($"Owner entries: {ownerById.Count}");
 
             // Redfin lookup.
             var redfinValueById = new Dictionary<string, (string url, double value)>(StringComparer.OrdinalIgnoreCase);
@@ -668,7 +678,7 @@ namespace ParcelFrontage
             }
 
             var matches = new List<(string id, string addr, string city, string state, string zip,
-                double width, double depth, string propwire, double marketValue, string redfinUrl, double redfinValue)>();
+                double width, double depth, string propwire, double marketValue, string redfinUrl, double redfinValue, string owner)>();
             for (int i = 1; i < rows.Count; i++)
             {
                 var row = rows[i];
@@ -680,10 +690,11 @@ namespace ParcelFrontage
                 string id = Get(row, idIdx);
                 marketValueById.TryGetValue(id, out double mv);
                 redfinValueById.TryGetValue(id, out var rf);
+                ownerById.TryGetValue(id, out string? owner);
 
                 matches.Add((
                     id, Get(row, addressIdx), Get(row, cityIdx), Get(row, stateIdx), Get(row, zipIdx),
-                    width, depth, Get(row, propwireIdx), mv, rf.url ?? "", rf.value));
+                    width, depth, Get(row, propwireIdx), mv, rf.url ?? "", rf.value, owner ?? ""));
             }
             Console.WriteLine($"Lots with width >= {floorWidth}: {matches.Count}");
 
@@ -766,6 +777,7 @@ namespace ParcelFrontage
                         m.marketValue,
                         m.redfinUrl,
                         m.redfinValue,
+                        m.owner,
                         lat,
                         lon
                     };
@@ -791,20 +803,48 @@ namespace ParcelFrontage
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <style>
         html, body { margin: 0; height: 100%; font-family: sans-serif; }
-        #map { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
+        body { display: flex; flex-direction: row; }
+        #sidebar {
+            flex: 0 0 340px; width: 340px; height: 100%;
+            display: flex; flex-direction: column;
+            border-right: 1px solid #ccc; background: #fff;
+            box-shadow: 2px 0 6px rgba(0,0,0,0.12); z-index: 1000;
+            overflow: hidden;
+        }
+        #map { flex: 1 1 auto; height: 100%; position: relative; }
         #controls {
-            position: absolute; top: 10px; left: 10px; z-index: 1000;
-            background: rgba(255,255,255,0.95); padding: 10px 12px;
-            border: 1px solid #ccc; border-radius: 6px;
-            box-shadow: 0 2px 6px rgba(0,0,0,0.2); font-size: 13px;
-            min-width: 230px;
+            flex: 0 0 auto; padding: 10px 12px; font-size: 13px;
+            border-bottom: 1px solid #e2e2e2;
         }
         #controls h3 { margin: 0 0 8px 0; font-size: 14px; }
         #controls label { display: inline-block; width: 70px; }
         #controls input[type=number] { width: 90px; padding: 2px 4px; }
         #controls .row { margin-bottom: 6px; }
         #controls .src { margin-top: 8px; }
-        #count { font-weight: 600; color: #1a73e8; margin-top: 6px; }
+        #listPanel {
+            flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column;
+            background: #fff;
+        }
+        #listHeader {
+            display: flex; align-items: center;
+            gap: 10px; padding: 6px 10px; border-bottom: 1px solid #ddd; flex: 0 0 auto;
+        }
+        #viewOnlyLabel { font-size: 12px; line-height: 1.1; white-space: nowrap; flex: 0 0 auto; }
+        #listTitle { margin: 0; font-size: 13px; font-weight: 600; color: #1a73e8; flex: 1 1 auto; }
+        #listBody { overflow: auto; flex: 1 1 auto; min-height: 0; }
+        #listBody table { border-collapse: collapse; width: 100%; font-size: 11px; }
+        #listBody th, #listBody td {
+            text-align: left; padding: 3px 6px; border-bottom: 1px solid #eee;
+        }
+        #listBody th {
+            position: sticky; top: 0; background: #f4f7fc; z-index: 1;
+            border-bottom: 1px solid #ccc; white-space: nowrap;
+        }
+        #listBody td.num { text-align: right; white-space: nowrap; }
+        #listBody td.addr { word-break: break-word; }
+        #listBody a { color: #1a73e8; text-decoration: none; }
+        #listBody a:hover { text-decoration: underline; }
+        #listBody tr:hover td { background: #f0f6ff; cursor: default; }
         .leaflet-popup-content { font-size: 13px; }
         .leaflet-popup-content a { color: #1a73e8; text-decoration: none; }
         .price-label {
@@ -821,26 +861,31 @@ namespace ParcelFrontage
     </style>
 </head>
 <body>
-    <div id="map"></div>
-    <div id="controls">
-        <h3>Filters</h3>
-        <div class="row"><label>Min width</label><input type="number" id="minW" value="58" step="1"> ft</div>
-        <div class="row"><label>Max width</label><input type="number" id="maxW" value="100" placeholder="any" step="1"> ft</div>
-        <div class="row"><label>Min value</label><input type="number" id="minV" value="0" placeholder="any" step="10000"> $</div>
-        <div class="row"><label>Max value</label><input type="number" id="maxV" value="800000" step="10000"> $</div>
-        <div class="src">
-            Value source:
-            <label style="width:auto"><input type="radio" name="src" value="redfin" checked> Redfin</label>
-            <label style="width:auto"><input type="radio" name="src" value="market"> Estimated</label>
+    <div id="sidebar">
+        <div id="controls">
+            <h3>Filters</h3>
+            <div class="row"><label>Min width</label><input type="number" id="minW" value="58" step="1"> ft</div>
+            <div class="row"><label>Max width</label><input type="number" id="maxW" value="100" placeholder="any" step="1"> ft</div>
+            <div class="row"><label>Min value</label><input type="number" id="minV" value="0" placeholder="any" step="10000"> $</div>
+            <div class="row"><label>Max value</label><input type="number" id="maxV" value="800000" step="10000"> $</div>
+            <div class="src">
+                Value source:
+                <label style="width:auto"><input type="radio" name="src" value="redfin" checked> Redfin</label>
+                <label style="width:auto"><input type="radio" name="src" value="market"> Estimated</label>
+            </div>
+            <div class="row" style="margin-top:8px">
+                <label style="width:auto"><input type="checkbox" id="showLabels" checked> Show price labels</label>
+            </div>
         </div>
-        <div class="row" style="margin-top:8px">
-            <label style="width:auto"><input type="checkbox" id="requireValue" checked> Require value</label>
+        <div id="listPanel">
+            <div id="listHeader">
+                <label id="viewOnlyLabel"><input type="checkbox" id="viewOnly"> In view only</label>
+                <h3 id="listTitle">0 lots shown</h3>
+            </div>
+            <div id="listBody"></div>
         </div>
-        <div class="row">
-            <label style="width:auto"><input type="checkbox" id="showLabels" checked> Show price labels</label>
-        </div>
-        <div id="count">0 lots shown</div>
     </div>
+    <div id="map"></div>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script>
         const ALL = {{markersJson}};
@@ -852,6 +897,39 @@ namespace ParcelFrontage
         }).addTo(map);
 
         const layer = L.layerGroup().addTo(map);
+
+        // Default (blue) and highlight (red) marker icons. The colored PNGs are
+        // the widely-used leaflet-color-markers assets served from a CDN.
+        const ICON_SHADOW = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-shadow.png';
+        const blueIcon = new L.Icon({
+            iconUrl: 'https://cdn.jsdelivr.net/gh/pointhi/leaflet-color-markers@master/img/marker-icon-blue.png',
+            shadowUrl: ICON_SHADOW,
+            iconSize: [25, 41], iconAnchor: [12, 41], popupAnchor: [1, -34], shadowSize: [41, 41]
+        });
+        const redIcon = new L.Icon({
+            iconUrl: 'https://cdn.jsdelivr.net/gh/pointhi/leaflet-color-markers@master/img/marker-icon-red.png',
+            shadowUrl: ICON_SHADOW,
+            iconSize: [25, 41], iconAnchor: [12, 41], popupAnchor: [1, -34], shadowSize: [41, 41]
+        });
+
+        const byId = {};
+        for (const m of ALL) byId[m.id] = m;
+        let highlightedId = null;
+
+        function highlightLot(id, on) {
+            const m = byId[id];
+            if (!m || !m._marker) return;
+            const marker = m._marker;
+            if (on) {
+                marker.setIcon(redIcon);
+                marker.setZIndexOffset(1000);
+                if (marker._shown && map.hasLayer(marker)) marker.openPopup();
+            } else {
+                marker.setIcon(blueIcon);
+                marker.setZIndexOffset(0);
+                marker.closePopup();
+            }
+        }
 
         function fmtMoney(v) {
             if (!v || v <= 0) return '';
@@ -872,6 +950,18 @@ namespace ParcelFrontage
         function valueOf(m, src) {
             return src === 'redfin' ? (m.redfinValue || 0) : (m.marketValue || 0);
         }
+        function redfinLink(m) {
+            if (m.redfinUrl) return m.redfinUrl;
+            // Fallback: Redfin address search when we don't have a resolved URL.
+            const q = [m.addr, m.city, m.state, m.zip]
+                .filter(x => x && String(x).trim().length > 0).join(' ').trim();
+            return `https://www.redfin.com/stingray/do/location-autocomplete?location=${encodeURIComponent(q)}`;
+        }
+        function escapeHtml(s) {
+            return String(s == null ? '' : s)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        }
 
         // Pre-build one Leaflet marker per lot ONCE. Popups are bound lazily
         // (built on first open) and the permanent price tooltip is created
@@ -879,7 +969,7 @@ namespace ParcelFrontage
         // DOM is recreated and there is no per-keystroke teardown cost.
         let labelsOn = true;
         function buildMarker(m) {
-            const marker = L.marker([m.lat, m.lon]);
+            const marker = L.marker([m.lat, m.lon], { icon: blueIcon });
             marker._lot = m;
             marker.on('popupopen', function () {
                 if (marker._popupBuilt) return;
@@ -934,9 +1024,9 @@ namespace ParcelFrontage
             const maxVRaw = document.getElementById('maxV').value;
             const maxV = maxVRaw === '' ? Infinity : parseFloat(maxVRaw);
             const src = document.querySelector('input[name=src]:checked').value;
-            const requireValue = document.getElementById('requireValue').checked;
             labelsOn = document.getElementById('showLabels').checked;
 
+            shown = [];
             let n = 0;
             for (const m of ALL) {
                 let show = true;
@@ -944,10 +1034,11 @@ namespace ParcelFrontage
                 else if (!isNaN(maxW) && m.width > maxW) show = false;
                 else {
                     const v = valueOf(m, src);
-                    if (requireValue && v <= 0) show = false;
-                    else if (v > 0) {
+                    if (v > 0) {
                         if (v < minV || v > maxV) show = false;
                     } else if (minV > 0 || isFinite(maxV)) {
+                        // No value for the selected source: only show when no
+                        // value bound is active.
                         show = false;
                     }
                 }
@@ -956,14 +1047,100 @@ namespace ParcelFrontage
                 if (show) {
                     applyLabel(m, src);
                     if (!marker._shown) { layer.addLayer(marker); marker._shown = true; }
+                    shown.push(m);
                     n++;
                 } else if (marker._shown) {
                     layer.removeLayer(marker);
                     marker._shown = false;
                 }
             }
-            document.getElementById('count').textContent = n.toLocaleString('en-US') + ' lots shown (of ' + ALL.length.toLocaleString('en-US') + ')';
+            currentSrc = src;
+            buildList();
         }
+
+        // ----- Lot list (always shown in the left sidebar) -----
+        let shown = [];
+        let currentSrc = 'redfin';
+
+        // Parse a US street address into { num, street } for sorting:
+        // leading digits -> house number; the rest -> street name (lowercased).
+        function parseAddr(a) {
+            const s = String(a || '').trim();
+            const m = s.match(/^(\d+)\s*(.*)$/);
+            if (m) return { num: parseInt(m[1], 10), street: m[2].toLowerCase() };
+            return { num: Number.MAX_SAFE_INTEGER, street: s.toLowerCase() };
+        }
+        function addrCompare(a, b) {
+            const pa = parseAddr(a.addr), pb = parseAddr(b.addr);
+            if (pa.street < pb.street) return -1;
+            if (pa.street > pb.street) return 1;
+            return pa.num - pb.num;
+        }
+
+        function buildList() {
+            // Clear any active hover highlight, since the rows are about to be
+            // replaced (prevents a pin from staying red after a rebuild).
+            if (highlightedId !== null) { highlightLot(highlightedId, false); highlightedId = null; }
+            const viewOnly = document.getElementById('viewOnly').checked;
+            let rows = shown;
+            if (viewOnly) {
+                const b = map.getBounds();
+                rows = rows.filter(m => b.contains([m.lat, m.lon]));
+            }
+            // Always sort by street name, then house number.
+            rows = rows.slice().sort(addrCompare);
+            let html =
+                '<table><thead><tr>' +
+                '<th>#</th><th>Address / Owner</th>' +
+                '<th class="num">Redfin</th>' +
+                '</tr></thead><tbody>';
+            for (let i = 0; i < rows.length; i++) {
+                const m = rows[i];
+                const addr = escapeHtml(m.addr);
+                const owner = escapeHtml(m.owner);
+                html +=
+                    '<tr data-id="' + escapeHtml(m.id) + '">' +
+                    '<td class="num">' + (i + 1) + '</td>' +
+                    '<td class="addr">' +
+                        '<a href="' + escapeHtml(redfinLink(m)) + '" target="_blank" rel="noopener">' + addr + '</a>' +
+                        (owner ? '<br/><span style="color:#888">' + owner + '</span>' : '') +
+                        '<br/><span style="color:#0b8043">' + m.width.toFixed(1) + ' × ' + m.depth.toFixed(1) + ' ft</span>' +
+                    '</td>' +
+                    '<td class="num">' + fmtMoneyFull(m.redfinValue) + '</td>' +
+                    '</tr>';
+            }
+            html += '</tbody></table>';
+            document.getElementById('listBody').innerHTML = html;
+            const totalShown = shown.length;
+            document.getElementById('listTitle').textContent = viewOnly
+                ? (rows.length.toLocaleString('en-US') + ' in view (of ' + totalShown.toLocaleString('en-US') + ')')
+                : (rows.length.toLocaleString('en-US') + ' lots shown');
+        }
+
+        document.getElementById('viewOnly').addEventListener('change', buildList);
+        // Refresh the list as the map is panned/zoomed, but only when the
+        // "in current view" option is active.
+        map.on('moveend', () => {
+            if (document.getElementById('viewOnly').checked) buildList();
+        });
+
+        // Hovering a list row highlights the matching pin red (event delegation,
+        // since the list HTML is rebuilt on every filter/pan).
+        const listBodyEl = document.getElementById('listBody');
+        function rowIdFromEvent(e) {
+            const tr = e.target && e.target.closest ? e.target.closest('tr[data-id]') : null;
+            return tr ? tr.getAttribute('data-id') : null;
+        }
+        listBodyEl.addEventListener('mouseover', (e) => {
+            const id = rowIdFromEvent(e);
+            if (id === highlightedId) return;
+            if (highlightedId !== null) highlightLot(highlightedId, false);
+            highlightedId = id;
+            if (id !== null) highlightLot(id, true);
+        });
+        listBodyEl.addEventListener('mouseleave', () => {
+            if (highlightedId !== null) { highlightLot(highlightedId, false); highlightedId = null; }
+        });
 
         // Debounce so fast typing coalesces into a single render.
         let renderTimer = null;
@@ -972,7 +1149,7 @@ namespace ParcelFrontage
             renderTimer = setTimeout(() => { renderTimer = null; render(); }, 120);
         }
 
-        for (const id of ['minW','maxW','minV','maxV','requireValue','showLabels']) {
+        for (const id of ['minW','maxW','minV','maxV','showLabels']) {
             document.getElementById(id).addEventListener('input', scheduleRender);
             document.getElementById(id).addEventListener('change', scheduleRender);
         }
@@ -1488,6 +1665,21 @@ namespace ParcelFrontage
             if (string.IsNullOrEmpty(t)) return t;
             if (t.All(char.IsDigit)) return t;
             return char.ToUpperInvariant(t[0]) + t.Substring(1).ToLowerInvariant();
+        }
+
+        // Combines owner first/last names into a display string. Falls back to
+        // owner 2 if owner 1 is blank, and joins both with " & " when present.
+        static string FormatOwner(string o1First, string o1Last, string o2First, string o2Last)
+        {
+            string One(string f, string l) =>
+                string.Join(" ", new[] { f, l }.Where(s => !string.IsNullOrWhiteSpace(s)).Select(s => s.Trim()));
+
+            string owner1 = One(o1First, o1Last);
+            string owner2 = One(o2First, o2Last);
+
+            if (!string.IsNullOrWhiteSpace(owner1) && !string.IsNullOrWhiteSpace(owner2))
+                return owner1 + " & " + owner2;
+            return !string.IsNullOrWhiteSpace(owner1) ? owner1 : owner2;
         }
 
         // -------------------------------------------------------------------

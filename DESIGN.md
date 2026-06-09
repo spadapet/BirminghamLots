@@ -303,6 +303,19 @@ radio (Redfin vs Estimated), "Require value" checkbox, "Show price labels"
 checkbox, and a live "N lots shown (of total)" counter. Default control values:
 min width 58, max width 100, min value 0, max value 800000, source = Redfin.
 
+**Lot list overlay:** the "N lots shown" counter is a **clickable button** (with
+a ▼/▲ chevron). Clicking it toggles a scrollable overlay panel that **slides down
+over the top ~45% of the map** (it does NOT push/resize the map, which would
+trigger expensive Leaflet relayout). The panel lists every currently-shown lot,
+sorted by the active value source descending, with columns: index, **Address**
+(a link to Redfin — uses the cached `redfin_url`, or a Redfin address-search
+fallback when none exists), **Owner**, **Redfin Value**, **Width (ft)**, **Depth
+(ft)**. The list rebuilds from the same filtered set on each render while open,
+and has a Close button. Owner names come from `lots.csv` (`Owner 1/2 First/Last
+Name`, joined with `&` for co-owners) via the `FormatOwner` C# helper and are
+baked into each marker as `m.owner`. HTML in the list is escaped client-side
+(`escapeHtml`).
+
 **Performance design (critical — was a bug fix):** the naive version rebuilt all
 markers/popups/tooltips on every keystroke and toggled thousands of *permanent*
 Leaflet tooltips, causing huge layout reflows (symptom: first keystroke very
